@@ -1,0 +1,452 @@
+/**
+\mainpage myspice - symulator obwodów liniowych
+
+Myspice jest programem pozwalającym na analizę elektronicznych obwodów liniowych. 
+Wykorzystuje on algorytm [MNA](https://lpsa.swarthmore.edu/Systems/Electrical/mna/MNA3.html) (ang. Modified Node Analysis), który
+pozwala zarówno na analizę obwodów prądu stałego jak i zmiennego, a nawet umożliwia symulację układów ze wzmacniaczami operacyjnymi.
+
+Z tego powodu program może zostać skompilowany w jednej z dwóch wersji:
+ - `legacy` - wersja podstawowa, zgodna z założeniami polecenia
+ - `extended` - wersja rozszerzona, częściowo zgoda z symulatorami z rodziny SPICE, rozszerzona o dodatkowe funkcje
+
+Ustawienie parametru CMake `EXTENDED` na `ON` przy kompilacji skutkuje kompilacją wersji rozszerzonej.
+
+## Wersja podstawowa
+Podstawowa wersja programu pozwala na symulację obwodów prądu stałego złożonych wyłącznie z rezystancji, SEM i SPM.
+
+By przeprowadzić analizę obwodu należy wywołać program w następujący sposób:
+```
+myspice NETLISTA [WYNIK]
+```
+gdzie `NETLISTA` to nazwa pliku zawierającego
+opis obwodu zgodny ze specyfikacją zadania 20, a `[WYNIK]` to opcjonalna nazwa pliku wynikowego.
+W przypadku niedostarczenia nazwy pliku wynikowego, wyniki zostaną wypisane na standardowe wyjście.
+Niedostarczenie żadnych argumentów powoduje wypisanie krótkiej informacji o sposobie użycia programu.
+
+Wynikiem działania programu jest lista potencjałów węzłowych oraz informacje o spadku napięcia, prądzie i mocy traconej na każdym z elementów układu.
+Przykładowo, dla prostego dzielnika rezystorowego 1/2, opisanego netlistą:
+```
+E 1 2 5
+R 2 3 1000
+R 3 1 1000
+```
+
+Wynikiem działania programu jest:
+```
+Potencjaly wezlowe:
+        V(1) = 0 V
+        V(2) = 5 V
+        V(3) = 2.5 V
+
+E1 - [1, 2]:
+        V(E1) = 5 V
+        I(E1) = -0.0025 A
+        P(E1) = -0.0125 W
+
+R1 - [2, 3]:
+        V(R1) = -2.5 V
+        I(R1) = -0.0025 A
+        P(R1) = 0.00625 W
+
+R2 - [3, 1]:
+        V(R2) = -2.5 V
+        I(R2) = -0.0025 A
+        P(R2) = 0.00625 W
+
+Moc calkowita: 0.0125 W.
+```
+
+Niestety treść zadania nie przewiduje sposobu określania węzła odniesienia (masy).
+Zważywszy na to, że wybór takiego węzła jest konieczny do przeprowadzenia analizy,
+program zawsze przyjmuje węzeł nr 1 jako punkt odniesienia. **Oznacza to, że węzeł 
+nr 1 jest wymagany, by przeprowadzenie poprawnej symulacji było możliwe.**
+
+W celu sprawdzenia poprawności działania programu, przykładowy obwód podany w treści
+zadania został zasymulowany w programach myspice, ngspice i LTSpice, a wyniki zostały
+porównane tutaj: \ref result-validation
+
+
+
+## Wersja rozszerzona
+Działanie rozszerzonej wersji programu zostało dokładniej opisane tutaj - \ref extended-version.
+
+## Zasada działania programu
+Zasada działania programu jest bardzo podobna w przypadku obu wersji - podstawowej i rozszerzonej. Pierwszym
+krokiem jest wczytanie i interpretacja netlisty. W wersji podstawowej jest to zadanie na tyle proste,
+że może być realizowane przez jedną funkcję (\ref read_netlist()). Tekstowa netlista jest przekształcana
+na wewnętrzną reprezentację obwodu - \ref circuit - zbiór nazwanych elementów.
+
+Analiza obwodów przeprowadzana jest przez klasę \ref circuit_solver. Po dostarczeniu jej obwodu \ref circuit,
+przekształca go na bardziej elementarną reprezentację - \ref mna::mna_problem - listę admitancji międzywęzłowych,
+SEM, SPM i wzmacniaczy operacyjnych. Admitancje międzywęzłowe obliczane są na podstawie typu elementów 
+w układzie i częstotliwości, dla której przeprowadzana jest analiza (\ref circuit_solver::solve()). 
+
+Na podstawie struktury \ref mna::mna_problem formułowany jest układ równań liniowych w postaci macierzowej (\ref matrix) zgodnie
+z algorytmem [MNA](https://lpsa.swarthmore.edu/Systems/Electrical/mna/MNA3.html). Do rozwiązania układu wykorzystywany
+jest algorytm eliminacji Gaussa (\ref mna::gaussian_elimination()). Na podstawie wektora będącego rozwiązaniem układu
+tworzona jest klasa \ref mna::mna_solution, która pozwala na łatwiejszą interpretację wyników - odczyt wybranych
+potencjałów węzłowych i prądów pobieranych z SEM (i wyjść wzmacniaczy operacyjnych).
+
+Po wywołaniu \ref circuit_solver::solve(), klasa \ref circuit_solver pozwala na odczyt napięć między węzłami
+układu, prądów płynących przez komponenty i mocy traconej na komponentach. Analiza punktu pracy DC kończy się
+wypisaniem właśnie tych informacji. W przypadku analizy AC (sweep), układ rozwiązywany jest dla różnych
+pulsacji z wybranego przedziału.
+
+Nic nie stoi na przeszkodzie, by w przyszłości dodać analizę stanów przejściowych (transient) i elementy
+nieliniowe. Prawdopodobnie dobrym punktem wyjścia jest implementacja pamięci stanu kondensatorów i 
+indukcyjności, tak jak to opisano [tutaj](http://qucs.sourceforge.net/tech/node26.html).
+
+*/
+
+/**
+\page extended-version Wersja rozszerzona
+
+Rozszerzona wersja programu pozwala na wykorzystywanie w układach dodatkowych elementów: kondensatorów,
+cewek i wzmacniaczy operacyjnych. Pozwala zatem na prowadzenie analizy punktu pracy DC oraz analizę AC.
+Istotną różnicą jest też obsługiwany format pliku wejściowego opisującego układ - jest on częściowo
+kompatybilny z formatem symulatorów z rodziny SPICE. Dane wejściowe są zawsze wczytywane przez standardowe
+wejście, a wyjściowe wypisywane na standardowe wyjście. Dodatkowo, rozluźnione zostały wymagania dotyczące
+numeracji węzłów w układzie. Wymagane jest tylko istnienie węzła zerowego, który stanowi punkt odniesienia (masę).
+
+Pełna interpretacja plików SPICE wymagałaby stworzenia zaawansowanego analizatora składni, co zdecydowanie
+wykracza poza tematykę zadania. Dlatego też obsługiwane są tylko następujące polecenia:
+ - `.ac lin/oct/dec N fs fe` - [analiza AC](http://bwrcs.eecs.berkeley.edu/Classes/IcBook/SPICE/UserGuide/analyses.html#790) dla zadanego przedziału częstotliwości [fs, fe]
+ - `.print dc/ac [mierzone wielkości]` - wypisanie mierzonych wartości
+
+Tabela wielkości możliwych do pomiaru/wyświetlenia:
+|Składnia|Znaczenie|
+|--------|---------|
+|`V(x)`|Pomiar potencjału węzła `x`. Odpowiednik `V(x, 0)`|
+|`V(x, y)`|Pomiar napięcia między węzłami `x` i `y`|
+|`I(c)`|Pomiar prądu płynącego przez komponent `c`|
+|`P(c)`|Pomiar mocy traconej na komponencie `c`|
+
+Przy analizie AC mamy do czynienia z zespolonymi wartościami napięć i prądów. W tym celu wprowadzone zostały
+dodatkowe oznaczenia umożliwiające pomiar wybranych parametrów wielkości zespolonej:
+|Składnia|Znaczenie|
+|--------|---------|
+|`V/P/Imag(x)`|Pomiar modułu wielkości zespolonej|
+|`V/P/Iph(x)`|Pomiar fazy (argumentu) wielkości zespolonej|
+|`V/P/Ire(x)`|Pomiar części rzeczywistej wielkości zespolonej|
+|`V/P/Iim(x)`|Pomiar części urojonej wielkości zespolonej|
+
+Tabela obsługiwanych elementów:
+|Składnia|Znaczenie|
+|---|---|
+|`Rx A B VAL` |Rezystor `Rx` o wartości `VAL` łączący węzły `A` i `B`|
+|`Cx A B VAL` |Kondensator `Cx` o wartości `VAL` łączący węzły `A` i `B`|
+|`Lx A B VAL` |Indukcyjność `Lx` o wartości `VAL` łącząca węzły `A` i `B`|
+|`Vx A B DCV [AC ACV]` |SEM o składowej stałej `DCV` i składowej zmiennej `ACV` podłączona dodatnim wyprowadzeniem do węzła `A` i ujemnym do węzła `B`|
+|`Ix A B DCI [AC ACI]` |SPM o składowej stałej `DCI` i składowej zmiennej `ACI` podłączona dodatnim wyprowadzeniem do węzła `A` i ujemnym do węzła `B`|
+|`OPAx P N O`|Idealny wzmacniacz operacyjny - wejście nieodwracające podłączone do węzła `P`, wej. odw. do węzła `N`, a wyjście do węzła `O`|
+
+Pierwsza linia pliku stanowi jest traktowana jako nazwa układu. Jeżeli w pliku nie znajduje się
+polecenie `.ac` przeprowadzana jest analiza punktu pracy DC (odpowiednik `.op` w SPICE).
+
+\note Symulacja wzmacniaczy operacyjnych opiera się na założeniu, że napięcie między węzłami wejściowymi jest równe 0, a wzmacniacz
+pracuje z ujemnym sprzężeniem zwrotnym. 
+
+## Przykłady
+
+### Dzielnik rezystorowy
+```
+Dzielnik 1/3 2/3
+V1 1 0 9
+R1 1 2 10k
+R2 2 3 10k
+R3 3 0 10k
+.print dc I(V1) V(1) V(2) V(3)
+```
+
+Wynik działania programu:
+```
+I(V1) = -0.0003
+V(1) = 9
+V(2) = 6
+V(3) = 3
+```
+
+### Dolnoprzepustowy filtr Sallen-Key II-rzędu
+Analiza odpowiedzi częstotliwościowej filtru aktywnego Sallen-Key II rzędu o częstotliwości odcięcia fc=1kHz.
+```
+Sallen-Key lowpass filter
+
+OPA1 4 3 4
+R1 1 2 16k
+R2 2 3 16k
+C1 2 4 0.01u
+C2 3 0 0.01u
+V1 1 0 0 ac 1
+
+.ac dec 5 10 100k
+.print ac V(4)
+```
+
+Wynik działania programu:
+```
+step    frequency       V(4)
+0       10      0.999899
+1       16.2378 0.999734
+2       26.3665 0.999298
+3       42.8133 0.998151
+4       69.5193 0.995139
+5       112.884 0.987285
+6       183.298 0.967159
+7       297.635 0.917827
+8       483.293 0.809023
+9       784.76  0.616369
+10      1274.27 0.378635
+11      2069.14 0.187726
+12      3359.82 0.0805895
+13      5455.59 0.0321746
+14      8858.67 0.0124515
+15      14384.5 0.00475925
+16      23357.2 0.00181039
+17      37926.9 0.000687396
+18      61584.8 0.000260819
+19      100000  9.89367e-05
+```
+
+Porównanie wyników symulacji w programie myspice i LTSpice. Na wykresie z programu
+LTSpice można zaobserwować "odbicie się" odpowiedzi częstotliwościowej układu w okolicach 100kHz.
+Jest to spowodowane zastosowaniem niedoskonałego wzmacniacza LT1001:
+
+\image html sallen.png  Wynik symulacji w myspice height=400px
+\image html sallen-ltspice.png Wynik symulacji w LTspice height=400px
+\image html sallen-ltspice-circ.png Odpowiadający układ w LTspice height=400px
+
+\image latex sallen.png  Wynik symulacji w myspice width=10cm
+\image latex sallen-ltspice.png Wynik symulacji w LTspice width=10cm
+\image latex sallen-ltspice-circ.png Odpowiadający układ w LTspice width=10cm
+
+### Układ rezonansowy RLC
+Przykładowa plik wejściowy - analiza odpowiedzi częstotliwościowej i przesunięcia fazy przez układ RLC w zakresie 100Hz-10kHz:
+```
+RLC circuit
+
+V1 1 0 1 AC 1
+R1 1 2 1m
+L1 2 4 100u
+C1 4 0 47u
+
+.ac oct 50 500 10k
+.print ac V(4) Vph(4)
+```
+
+\image html rlc.png Transmitancja układu height=400px
+\image html rlc-phase.png Przesunięcie fazy na wyjściu układu height=400px
+
+\image latex rlc.png Transmitancja układu width=10cm
+\image latex rlc-phase.png Przesunięcie fazy na wyjściu układu width=10cm
+
+
+*/
+
+/**
+\page result-validation Sprawdzenie poprawności
+
+\image html example.png
+\image latex example.png width=10cm
+
+Netlista w formacie określonym przez zadanie:
+```
+R 4 2 2
+I 5 4 2
+R 5 3 4
+E 3 2 -5
+E 3 1 1
+R 1 2 1
+R 3 1 15
+```
+
+Netlista SPICE:
+```
+test
+R1 N2 N4 2
+R2 N3 N5 4
+R3 0 N2 1
+R4 0 N3 15
+I1 N5 N4 2
+V1 N3 N2 5
+V2 0 N3 1
+.op
+.backanno
+.end
+```
+
+## myspice
+```
+Potencjaly wezlowe:
+        V(1) = 0 V
+        V(2) = -6 V
+        V(3) = -1 V
+        V(4) = -2 V
+        V(5) = -9 V
+
+E1 - [3, 2]:
+        V(E1) = -5 V
+        I(E1) = 8 A
+        P(E1) = -40 W
+
+E2 - [3, 1]:
+        V(E2) = 1 V
+        I(E2) = -6.06667 A
+        P(E2) = -6.06667 W
+
+I1 - [5, 4]:
+        V(I1) = 7 V
+        I(I1) = -2 A
+        P(I1) = -14 W
+
+R1 - [4, 2]:
+        V(R1) = -4 V
+        I(R1) = -2 A
+        P(R1) = 8 W
+
+R2 - [5, 3]:
+        V(R2) = 8 V
+        I(R2) = 2 A
+        P(R2) = 16 W
+
+R3 - [1, 2]:
+        V(R3) = -6 V
+        I(R3) = -6 A
+        P(R3) = 36 W
+
+R4 - [3, 1]:
+        V(R4) = 1 V
+        I(R4) = 0.0666667 A
+        P(R4) = 0.0666667 W
+
+Moc calkowita: 60.0667 W.
+```
+
+## LTSpice
+```
+       --- Operating Point ---
+
+V(n2):	 -6         voltage
+V(n4):	 -2         voltage
+V(n3):	 -1         voltage
+V(n5):	 -9         voltage
+I(I1):	 2          device_current
+I(R4):	 0.0666667  device_current
+I(R3):	 6          device_current
+I(R2):	 2          device_current
+I(R1):	 -2         device_current
+I(V2):	 -6.06667   device_current
+I(V1):	 -8         device_current
+
+```
+
+## ngspice
+```
+Circuit: test
+
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+
+No. of Data Rows : 1
+	Node                                  Voltage
+	----                                  -------
+	----	-------
+	n5                               -9.00000e+00
+	n3                               -1.00000e+00
+	n4                               -2.00000e+00
+	n2                               -6.00000e+00
+
+	Source	Current
+	------	-------
+
+	v1#branch                        -8.00000e+00
+	v2#branch                        -6.06667e+00
+
+ Resistor models (Simple linear resistor)
+      model                     R
+
+        rsh                     0
+     narrow                     0
+      short                     0
+        tc1                     0
+        tc2                     0
+        tce                     0
+       defw                 1e-05
+          l                 1e-05
+         kf                     0
+         af                     0
+          r                     0
+     bv_max                 1e+99
+         lf                     1
+         wf                     1
+         ef                     1
+
+ Isource: Independent current source
+     device                    i1
+         dc                     2
+          m                     1
+      acmag                     0
+      pulse         -
+        sin         -
+        exp         -
+        pwl         -
+       sffm         -
+         am         -
+    trnoise         -
+   trrandom         -
+          v                     7
+          p                   -14
+    current                     2
+
+ Resistor: Simple linear resistor
+     device                    r4                    r3                    r2
+      model                     R                     R                     R
+ resistance                    15                     1                     4
+         ac                    15                     1                     4
+      dtemp                     0                     0                     0
+     bv_max                 1e+99                 1e+99                 1e+99
+      noisy                     1                     1                     1
+          i             0.0666667                     6                     2
+          p             0.0666667                    36                    16
+
+ Resistor: Simple linear resistor
+     device                    r1
+      model                     R
+ resistance                     2
+         ac                     2
+      dtemp                     0
+     bv_max                 1e+99
+      noisy                     1
+          i                    -2
+          p                     8
+
+ Vsource: Independent voltage source
+     device                    v2                    v1
+         dc                     1                     5
+      acmag                     0                     0
+      pulse         -         -
+        sin         -         -
+        exp         -         -
+        pwl         -         -
+       sffm         -         -
+         am         -         -
+    trnoise         -         -
+   trrandom         -         -
+          i              -6.06667                    -8
+          p               6.06667                    40
+
+
+Total analysis time (seconds) = 0.001
+
+Total elapsed time (seconds) = 0.008 
+
+Total DRAM available = 32045.613 MB.
+DRAM currently available = 22306.926 MB.
+Maximum ngspice program size =   15.723 MB.
+Current ngspice program size =    9.492 MB.
+
+Shared ngspice pages =    8.105 MB.
+Text (code) pages =    5.090 MB.
+Stack = 0 bytes.
+Library pages =    1.848 MB.
+```
+*/

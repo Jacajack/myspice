@@ -1,0 +1,6 @@
+build
+old
+doc
+**/*.bak
+sprawozdanie/*.*
+!sprawozdanie/*.tex
